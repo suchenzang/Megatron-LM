@@ -32,6 +32,8 @@ from .initialize import get_tensor_model_parallel_group
 from .initialize import get_tensor_model_parallel_rank
 from .initialize import get_tensor_model_parallel_world_size
 
+from torch.utils.checkpoint import check_backward_validity, get_device_states, set_device_states, detach_variable
+
 
 # Default name for the model parallel rng tracker.
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
@@ -219,13 +221,9 @@ def model_parallel_cuda_manual_seed(seed):
 
 
 class CheckpointFunction(torch.autograd.Function):
-    """This function is adapted from torch.utils.checkpoint with
-       two main changes:
-           1) torch.cuda.set_rng_state is replaced with `_set_cuda_rng_state`
-           2) the states in the model parallel tracker are also properly
-              tracked/set/reset.
-    """
+
     @staticmethod
+<<<<<<< HEAD:megatron/mpu/random.py
     def forward(ctx, run_function, distribute_checkpointed_activations, *args):
         ctx.run_function = run_function
         ctx.distribute_checkpointed_activations \
@@ -236,6 +234,24 @@ class CheckpointFunction(torch.autograd.Function):
         ctx.fwd_cuda_rng_state = torch.cuda.get_rng_state()
         ctx.fwd_cuda_rng_state_tracker = get_cuda_rng_tracker().get_states()
 
+=======
+    def forward(ctx, run_function, preserve_rng_state, *args):
+        check_backward_validity(args)
+        ctx.run_function = run_function
+        ctx.preserve_rng_state = preserve_rng_state
+        ctx.fwd_cuda_rng_state_tracker = get_cuda_rng_tracker().get_states()
+        if preserve_rng_state:
+            ctx.fwd_cpu_state = torch.get_rng_state()
+            # Don't eagerly initialize the cuda context by accident.
+            # (If the user intends that the context is initialized later, within their
+            # run_function, we SHOULD actually stash the cuda state here.  Unfortunately,
+            # we have no way to anticipate this will happen before we run the function.)
+            ctx.had_cuda_in_fwd = False
+            if torch.cuda._initialized:
+                ctx.had_cuda_in_fwd = True
+                ctx.fwd_gpu_devices, ctx.fwd_gpu_states = get_device_states(*args)
+        ctx.save_for_backward(*args)
+>>>>>>> adb2332 (fixed model parallel gradient checkpointing with pytorch 1.4 version):mpu/random.py
         with torch.no_grad():
             outputs = run_function(*args)
 
@@ -254,9 +270,9 @@ class CheckpointFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *args):
         if not torch.autograd._is_checkpoint_valid():
-            raise RuntimeError("Checkpointing is not compatible with .grad(), "
-                               "please use .backward() if possible")
+            raise RuntimeError("Checkpointing is not compatible with .grad(), please use .backward() if possible")
         inputs = ctx.saved_tensors
+<<<<<<< HEAD:megatron/mpu/random.py
         if ctx.distribute_checkpointed_activations:
             inputs[0].data = gather_split_1d_tensor(inputs[0].data)
             inputs[0].data = inputs[0].data.view(ctx.input_0_shape)
@@ -264,25 +280,28 @@ class CheckpointFunction(torch.autograd.Function):
         # Store the current states.
         bwd_cpu_rng_state = torch.get_rng_state()
         bwd_cuda_rng_state = torch.cuda.get_rng_state()
+=======
+        # Stash the surrounding rng state, and mimic the state that was
+        # present at this time during forward.  Restore the surrouding state
+        # when we're done.
+        rng_devices = []
+        if ctx.preserve_rng_state and ctx.had_cuda_in_fwd:
+            rng_devices = ctx.fwd_gpu_devices
+>>>>>>> adb2332 (fixed model parallel gradient checkpointing with pytorch 1.4 version):mpu/random.py
         bwd_cuda_rng_state_tracker = get_cuda_rng_tracker().get_states()
-
-        # Set the states to what it used to be before the forward pass.
-        torch.set_rng_state(ctx.fwd_cpu_rng_state)
-        _set_cuda_rng_state(ctx.fwd_cuda_rng_state)
-        get_cuda_rng_tracker().set_states(ctx.fwd_cuda_rng_state_tracker)
-
-        # Compute the forward pass.
-        detached_inputs = detach_variable(inputs)
-        with torch.enable_grad():
-            outputs = ctx.run_function(*detached_inputs)
-
-        # Set the states back to what it was at the start of this function.
-        torch.set_rng_state(bwd_cpu_rng_state)
-        _set_cuda_rng_state(bwd_cuda_rng_state)
-        get_cuda_rng_tracker().set_states(bwd_cuda_rng_state_tracker)
+        with torch.random.fork_rng(devices=rng_devices, enabled=ctx.preserve_rng_state):
+            if ctx.preserve_rng_state:
+                torch.set_rng_state(ctx.fwd_cpu_state)
+                if ctx.had_cuda_in_fwd:
+                    set_device_states(ctx.fwd_gpu_devices, ctx.fwd_gpu_states)
+                get_cuda_rng_tracker().set_states(ctx.fwd_cuda_rng_state_tracker)
+            detached_inputs = detach_variable(inputs)
+            with torch.enable_grad():
+                outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
+        get_cuda_rng_tracker().set_states(bwd_cuda_rng_state_tracker)
         torch.autograd.backward(outputs, args)
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp
                       for inp in detached_inputs)
@@ -292,5 +311,9 @@ class CheckpointFunction(torch.autograd.Function):
 def checkpoint(function, distribute_checkpointed_activations, *args):
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
+<<<<<<< HEAD:megatron/mpu/random.py
     return CheckpointFunction.apply(function,
                                     distribute_checkpointed_activations, *args)
+=======
+    return CheckpointFunction.apply(function, True, *args)
+>>>>>>> adb2332 (fixed model parallel gradient checkpointing with pytorch 1.4 version):mpu/random.py
