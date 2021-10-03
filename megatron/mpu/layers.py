@@ -111,7 +111,7 @@ def _initialize_affine_weight_cpu(weight, output_size, input_size,
                                 requires_grad=False)
     init_method(master_weight)
     # args = get_args()
-    master_weight = master_weight.to(dtype=torch.half)
+    master_weight = master_weight.to(dtype=torch.float)
 
     # Split and copy
     per_partition_per_stride_size = divide(per_partition_size, stride)
@@ -126,6 +126,32 @@ def _initialize_affine_weight_cpu(weight, output_size, input_size,
     if return_master_weight:
         return master_weight
     return None
+
+
+def _initialize_affine_bias_cpu(bias, output_size,
+                                  per_partition_size, partition_dim,
+                                  init_method, stride=1,):
+    """Initialize affine weight for model parallel.
+
+    Build the master weight on all processes and scatter
+    the relevant chunk."""
+    # Initialize master weight
+    master_bias = torch.empty(output_size,
+                                dtype=torch.float,
+                                requires_grad=False)
+    init_method(master_bias)
+    master_bias = master_bias.to(dtype=torch.float)
+
+    # Split and copy
+    per_partition_per_stride_size = divide(per_partition_size, stride)
+    bias_list = torch.split(master_bias, per_partition_per_stride_size,
+                              dim=partition_dim)
+    rank = get_tensor_model_parallel_rank()
+    world_size = get_tensor_model_parallel_world_size()
+    my_bias_list = bias_list[rank::world_size]
+
+    with torch.no_grad():
+        torch.cat(my_bias_list, dim=partition_dim, out=bias)
 
 
 class VocabParallelEmbedding(torch.nn.Module):
@@ -339,7 +365,8 @@ class ColumnParallelLinear(torch.nn.Module):
                  init_method=init.xavier_normal_, stride=1,
                  keep_master_weight_for_test=False,
                  skip_bias_add=False, use_cpu_initialization=True,
-                 no_async_tensor_model_parallel_allreduce=False):
+                 no_async_tensor_model_parallel_allreduce=False,
+                 init_method_bias=None):
         super(ColumnParallelLinear, self).__init__()
 
         # Keep input parameters
@@ -356,6 +383,30 @@ class ColumnParallelLinear(torch.nn.Module):
         # we allocate the transpose.
         # Initialize weight.
         # args = get_args()
+        if bias:
+            if use_cpu_initialization:
+                self.bias = Parameter(torch.empty(
+                    self.output_size_per_partition, 
+                    # dtype=torch.half
+                    ))
+            else:
+                self.bias = Parameter(torch.empty(
+                    self.output_size_per_partition,
+                    device=torch.cuda.current_device(),
+                    dtype=torch.half))
+            set_tensor_model_parallel_attributes(self.bias, True, 0, stride)
+
+            if init_method_bias is not None:
+                _initialize_affine_bias_cpu(
+                    self.bias, self.output_size, self.output_size_per_partition,
+                    0, init_method_bias
+                )
+            else:
+                # Always initialize bias to zero.
+                with torch.no_grad():
+                    self.bias.zero_()
+        else:
+            self.register_parameter('bias', None)
         if use_cpu_initialization:
             self.weight = Parameter(torch.empty(self.output_size_per_partition,
                                                 self.input_size,
