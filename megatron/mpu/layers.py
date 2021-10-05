@@ -207,23 +207,27 @@ class VocabParallelEmbedding(torch.nn.Module):
     def forward(self, input_):
         if self.tensor_model_parallel_size > 1:
             # Build the mask.
-            input_mask = (input_ < self.vocab_start_index) | \
-                         (input_ >= self.vocab_end_index)
+            input_mask = (input_ < self.vocab_start_index) \
+                | (input_ >= self.vocab_end_index)
             # Mask the input.
             masked_input = input_.clone() - self.vocab_start_index
-            masked_input[input_mask] = 0
+            masked_input.masked_fill_(input_mask, 0.0)
         else:
             masked_input = input_
+            
             # Get the embeddings.
         output_parallel = F.embedding(masked_input, self.weight,
                                       self.padding_idx, self.max_norm,
                                       self.norm_type, self.scale_grad_by_freq,
                                       self.sparse)
+
         # Mask the output embedding.
         if self.tensor_model_parallel_size > 1:
-            output_parallel[input_mask, :] = 0.0
+            output_parallel.masked_fill_(input_mask.unsqueeze(2), 0.0)
+
         # Reduce across all the model parallel GPUs.
         output = reduce_from_tensor_model_parallel_region(output_parallel)
+        
         return output
 
 
@@ -365,7 +369,7 @@ class ColumnParallelLinear(torch.nn.Module):
                  init_method=init.xavier_normal_, stride=1,
                  keep_master_weight_for_test=False,
                  skip_bias_add=False, use_cpu_initialization=True,
-                 no_async_tensor_model_parallel_allreduce=False,
+                 no_async_tensor_model_parallel_allreduce=True,
                  init_method_bias=None):
         super(ColumnParallelLinear, self).__init__()
 
@@ -383,30 +387,6 @@ class ColumnParallelLinear(torch.nn.Module):
         # we allocate the transpose.
         # Initialize weight.
         # args = get_args()
-        if bias:
-            if use_cpu_initialization:
-                self.bias = Parameter(torch.empty(
-                    self.output_size_per_partition, 
-                    # dtype=torch.half
-                    ))
-            else:
-                self.bias = Parameter(torch.empty(
-                    self.output_size_per_partition,
-                    device=torch.cuda.current_device(),
-                    dtype=torch.half))
-            set_tensor_model_parallel_attributes(self.bias, True, 0, stride)
-
-            if init_method_bias is not None:
-                _initialize_affine_bias_cpu(
-                    self.bias, self.output_size, self.output_size_per_partition,
-                    0, init_method_bias
-                )
-            else:
-                # Always initialize bias to zero.
-                with torch.no_grad():
-                    self.bias.zero_()
-        else:
-            self.register_parameter('bias', None)
         if use_cpu_initialization:
             self.weight = Parameter(torch.empty(self.output_size_per_partition,
                                                 self.input_size,
@@ -435,9 +415,16 @@ class ColumnParallelLinear(torch.nn.Module):
                     device=torch.cuda.current_device(),
                     dtype=torch.half))
             set_tensor_model_parallel_attributes(self.bias, True, 0, stride)
-            # Always initialize bias to zero.
-            with torch.no_grad():
-                self.bias.zero_()
+
+            if init_method_bias is not None:
+                _initialize_affine_bias_cpu(
+                    self.bias, self.output_size, self.output_size_per_partition,
+                    0, init_method_bias
+                )
+            else:
+                # Always initialize bias to zero.
+                with torch.no_grad():
+                    self.bias.zero_()
         else:
             self.register_parameter('bias', None)
         self.async_tensor_model_parallel_allreduce = (
