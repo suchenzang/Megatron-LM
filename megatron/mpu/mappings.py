@@ -18,6 +18,12 @@ import torch
 from .initialize import get_tensor_model_parallel_group, get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
 from .utils import split_tensor_along_last_dim
 
+import os
+if os.getenv("SET_ALL_REDUCE_DUMMY_VALUE", "0") == "1":
+    set_all_reduce_dummy_value = True
+else:
+    set_all_reduce_dummy_value = False
+
 
 def _reduce(input_):
     """All-reduce the input tensor across model parallel group."""
@@ -25,7 +31,8 @@ def _reduce(input_):
     # Bypass the function if we are using only 1 GPU.
     if get_tensor_model_parallel_world_size()==1:
         return input_
-
+    if set_all_reduce_dummy_value:
+        input_.fill_(0.01)
     # All-reduce.
     torch.distributed.all_reduce(input_, group=get_tensor_model_parallel_group())
 
