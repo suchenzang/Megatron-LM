@@ -32,7 +32,7 @@ def _reduce(input_):
     if get_tensor_model_parallel_world_size()==1:
         return input_
     if set_all_reduce_dummy_value:
-        input_.fill_(0.01)
+        input_ = input_.float().half()
     # All-reduce.
     torch.distributed.all_reduce(input_, group=get_tensor_model_parallel_group())
 
