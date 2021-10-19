@@ -128,6 +128,16 @@ def _initialize_affine_weight_cpu(weight, output_size, input_size,
     return None
 
 
+def _initialize_affine_bias_gpu(bias, init_method):
+    """Initialize affine weight for model parallel.
+
+    Build the master weight on all processes and scatter
+    the relevant chunk."""
+    # Initialize master weight
+    with get_cuda_rng_tracker().fork():
+        init_method(bias)
+
+
 def _initialize_affine_bias_cpu(bias, output_size,
                                   per_partition_size, partition_dim,
                                   init_method, stride=1,):
@@ -417,10 +427,15 @@ class ColumnParallelLinear(torch.nn.Module):
             set_tensor_model_parallel_attributes(self.bias, True, 0, stride)
 
             if init_method_bias is not None:
-                _initialize_affine_bias_cpu(
-                    self.bias, self.output_size, self.output_size_per_partition,
-                    0, init_method_bias
-                )
+                if use_cpu_initialization:
+                    _initialize_affine_bias_cpu(
+                        self.bias, self.output_size, self.output_size_per_partition,
+                        0, init_method_bias
+                    )
+                else:
+                    _initialize_affine_bias_gpu(
+                        self.bias, init_method_bias
+                    )
             else:
                 # Always initialize bias to zero.
                 with torch.no_grad():
