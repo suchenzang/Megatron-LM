@@ -160,6 +160,10 @@ def initialize_model_parallel(tensor_model_parallel_size_=1,
         if rank in ranks:
             _TENSOR_MODEL_PARALLEL_GROUP = group
 
+
+    if pipeline_model_parallel_size_ == 1:
+        return
+
     # Build the pipeline model-parallel groups and embedding groups
     # (first and last rank in each pipeline model-parallel group).
     global _PIPELINE_MODEL_PARALLEL_GROUP
