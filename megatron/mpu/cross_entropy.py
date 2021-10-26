@@ -46,19 +46,20 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         # Create a mask of valid vocab ids (1 means it needs to be masked).
         target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
         masked_target = target.clone() - vocab_start_index
-        masked_target[target_mask] = 0
+        masked_target.masked_fill_(target_mask, 0)
 
         # Get predicted-logits = logits[target].
         # For Simplicity, we convert logits to a 2-D tensor with size
         # [*, partition-vocab-size] and target to a 1-D tensor of size [*].
         logits_2d = vocab_parallel_logits.view(-1, partition_vocab_size)
         masked_target_1d = masked_target.view(-1)
-        arange_1d = torch.arange(start=0, end=logits_2d.size()[0],
-                                 device=logits_2d.device)
-        predicted_logits_1d = logits_2d[arange_1d, masked_target_1d]
-        predicted_logits_1d = predicted_logits_1d.clone().contiguous()
+        #arange_1d = torch.arange(start=0, end=logits_2d.size()[0],
+        #                         device=logits_2d.device)
+        #predicted_logits_1d = logits_2d[arange_1d, masked_target_1d]
+        #predicted_logits_1d = predicted_logits_1d.clone().contiguous()
+        predicted_logits_1d = logits_2d.gather(-1, masked_target_1d.unsqueeze(-1))
         predicted_logits = predicted_logits_1d.view_as(target)
-        predicted_logits[target_mask] = 0.0
+        predicted_logits.masked_fill_(target_mask, 0.0)
         # All reduce is needed to get the chunks from other GPUs.
         torch.distributed.all_reduce(predicted_logits,
                                      op=torch.distributed.ReduceOp.SUM,
@@ -94,10 +95,15 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         grad_2d = grad_input.view(-1, partition_vocab_size)
 
         # Add the gradient from matching classes.
-        arange_1d = torch.arange(start=0, end=grad_2d.size()[0],
-                                 device=grad_2d.device)
-        grad_2d[arange_1d, masked_target_1d] -= (
-            1.0 - target_mask.view(-1).float())
+        #arange_1d = torch.arange(start=0, end=grad_2d.size()[0],
+        #                         device=grad_2d.device)
+        #grad_2d[arange_1d, masked_target_1d] -= (
+        #    1.0 - target_mask.view(-1).float())
+        grad_2d.scatter_add_(
+            -1,
+            masked_target_1d.unsqueeze(-1),
+            target_mask.view(-1, 1).float() - 1.0
+        )
 
         # Finally elementwise multiplication with the output gradients.
         grad_input.mul_(grad_output.unsqueeze(dim=-1))

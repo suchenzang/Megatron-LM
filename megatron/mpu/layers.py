@@ -224,7 +224,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             masked_input.masked_fill_(input_mask, 0.0)
         else:
             masked_input = input_
-            
+
             # Get the embeddings.
         output_parallel = F.embedding(masked_input, self.weight,
                                       self.padding_idx, self.max_norm,
@@ -233,11 +233,11 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         # Mask the output embedding.
         if self.tensor_model_parallel_size > 1:
-            output_parallel.masked_fill_(input_mask.unsqueeze(2), 0.0)
+            output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0.0)
 
         # Reduce across all the model parallel GPUs.
         output = reduce_from_tensor_model_parallel_region(output_parallel)
-        
+
         return output
 
 
