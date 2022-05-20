@@ -32,6 +32,8 @@ from .mappings import copy_to_tensor_model_parallel_region
 from .mappings import gather_from_tensor_model_parallel_region
 from .mappings import reduce_from_tensor_model_parallel_region
 from .mappings import scatter_to_tensor_model_parallel_region
+from .mappings import gather_forward_reduce_scatter_backward
+from .mappings import reduce_scatter_forward_gather_backward
 from .random import get_cuda_rng_tracker
 from .utils import divide
 from .utils import split_tensor_along_last_dim
@@ -301,7 +303,8 @@ class ColumnParallelLinear(torch.nn.Module):
                  skip_bias_add=False, use_cpu_initialization=True,
                  no_async_tensor_model_parallel_allreduce=True,
                  init_method_bias=None,
-                 dtype=torch.half):
+                 dtype=torch.half,
+                 is_sequence_parallel=False):
         super(ColumnParallelLinear, self).__init__()
 
         # Keep input parameters
@@ -312,7 +315,7 @@ class ColumnParallelLinear(torch.nn.Module):
         world_size = get_tensor_model_parallel_world_size()
         self.output_size_per_partition = divide(output_size, world_size)
         self.skip_bias_add = skip_bias_add
-
+        self.is_sequence_parallel = is_sequence_parallel
         # Parameters.
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
         # we allocate the transpose.
@@ -384,7 +387,10 @@ class ColumnParallelLinear(torch.nn.Module):
                         input_shape[0], input_shape[1], output_parallel.shape[1])
         else:
             # Set up backprop all-reduce.
-            input_parallel = copy_to_tensor_model_parallel_region(input_)
+            if self.is_sequence_parallel:
+                input_parallel = gather_forward_reduce_scatter_backward(input_)
+            else:
+                input_parallel = copy_to_tensor_model_parallel_region(input_)
 
             # Matrix multiply.
             output_parallel = F.linear(input_parallel, self.weight, bias)
@@ -433,7 +439,8 @@ class RowParallelLinear(torch.nn.Module):
                  init_method=init.xavier_normal_, stride=1,
                  keep_master_weight_for_test=False,
                  skip_bias_add=False, use_cpu_initialization=True,
-                 dtype=torch.half):
+                 dtype=torch.half,
+                 is_sequence_parallel=False):
         super(RowParallelLinear, self).__init__()
         # Keep input parameters
         self.input_size = input_size
@@ -443,6 +450,7 @@ class RowParallelLinear(torch.nn.Module):
         world_size = get_tensor_model_parallel_world_size()
         self.input_size_per_partition = divide(input_size, world_size)
         self.skip_bias_add = skip_bias_add
+        self.is_sequence_parallel = is_sequence_parallel
 
         # Parameters.
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
@@ -488,7 +496,10 @@ class RowParallelLinear(torch.nn.Module):
         # Matrix multiply.
         output_parallel = F.linear(input_parallel, self.weight)
         # All-reduce across all the partitions.
-        output_ = reduce_from_tensor_model_parallel_region(output_parallel)
+        if self.is_sequence_parallel:
+            output_ = reduce_scatter_forward_gather_backward(output_parallel)
+        else:
+            output_ = reduce_from_tensor_model_parallel_region(output_parallel)
         if not self.skip_bias_add:
             output = output_ + self.bias if self.bias is not None else output_
             output_bias = None
@@ -497,3 +508,15 @@ class RowParallelLinear(torch.nn.Module):
             output_bias = self.bias
         return output, output_bias
 
+
+class SequenceParallelLayerNormWrapper(torch.nn.Module):
+    def __init__(self, layernorm, sequence_dim=0):
+        super().__init__()
+        self.module = layernorm
+        self.tp_world_size = get_tensor_model_parallel_world_size()
+        self.sequence_dim = sequence_dim
+
+    def forward(self, x):
+        x_chunks = torch.chunk(x, self.tp_world_size, dim=self.sequence_dim)
+        x = x_chunks[get_tensor_model_parallel_rank()]
+        return self.module(x)

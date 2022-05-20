@@ -16,7 +16,7 @@
 import torch
 
 from .initialize import get_tensor_model_parallel_group, get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
-from .utils import split_tensor_along_last_dim
+from .utils import split_tensor_along_last_dim, divide
 
 import os
 if os.getenv("SET_ALL_REDUCE_DUMMY_VALUE", "0") == "1":
@@ -58,7 +58,7 @@ def _split(input_):
     return output
 
 
-def _gather(input_):
+def _gather(input_, gather_dim=None):
     """Gather tensors and concatinate along the last dimension."""
 
     world_size = get_tensor_model_parallel_world_size()
@@ -74,11 +74,34 @@ def _gather(input_):
     tensor_list[rank] = input_
     torch.distributed.all_gather(tensor_list, input_, group=get_tensor_model_parallel_group())
 
+    dim_to_gather = gather_dim if gather_dim is not None else last_dim
     # Note: torch.cat already creates a contiguous tensor.
-    output = torch.cat(tensor_list, dim=last_dim).contiguous()
+    output = torch.cat(tensor_list, dim=dim_to_gather).contiguous()
 
     return output
 
+
+def _reduce_scatter(input_, dim=0):
+    """Gather tensors and concatinate along the last dimension."""
+
+    if get_tensor_model_parallel_world_size()==1:
+        return input_
+
+    output_dim = divide(input_.size(0), get_tensor_model_parallel_world_size())
+    if torch.distributed.get_rank() == 0:
+        from metaseq.pdb import set_trace; set_trace()
+    else:
+        from time import sleep; sleep(10000)
+
+    output = torch.empty(
+        torch.Size(output_dim) + input_.shape[1:],
+        dtype=input_.dtype,
+        device=input_.device,
+    )
+
+    dist._reduce_scatter_base(output, input_, group=get_tensor_model_parallel_group())
+
+    return output
 
 class _CopyToModelParallelRegion(torch.autograd.Function):
     """Pass the input to the model parallel region."""
@@ -145,6 +168,34 @@ class _GatherFromModelParallelRegion(torch.autograd.Function):
         return _split(grad_output)
 
 
+class _GatherForwarReduceScatterBackward(torch.autograd.Function):
+    @staticmethod
+    def symbolic(graph, input_):
+        return _gather(input_, gather_dim=0)
+
+    @staticmethod
+    def forward(ctx, input_):
+        return _gather(input_, gather_dim=0)
+
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return _reduce_scatter(grad_output, dim=0)
+
+
+class _ReduceScatterForwardGatherBackward(torch.autograd.Function):
+    @staticmethod
+    def symbolic(graph, input_):
+        return _reduce_scatter(input_, dim=0)
+
+    @staticmethod
+    def forward(ctx, input_):
+        return _reduce_scatter(input_, dim=0)
+
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return _gather(grad_output)
 # -----------------
 # Helper functions.
 # -----------------
@@ -163,3 +214,9 @@ def scatter_to_tensor_model_parallel_region(input_):
 
 def gather_from_tensor_model_parallel_region(input_):
     return _GatherFromModelParallelRegion.apply(input_)
+
+def gather_forward_reduce_scatter_backward(input_):
+    return _GatherForwarReduceScatterBackward.apply(input_)
+
+def reduce_scatter_forward_gather_backward(input_):
+    return _ReduceScatterForwardGatherBackward.apply(input_)
