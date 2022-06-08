@@ -381,7 +381,9 @@ class ColumnParallelLinear(torch.nn.Module):
                  skip_bias_add=False, use_cpu_initialization=True,
                  no_async_tensor_model_parallel_allreduce=True,
                  init_method_bias=None,
-                 dtype=torch.half):
+                 dtype=torch.half,
+                 sequence_parallel=False,
+                 gradient_accumulation_fusion=False):
         super(ColumnParallelLinear, self).__init__()
 
         # Keep input parameters
@@ -447,11 +449,11 @@ class ColumnParallelLinear(torch.nn.Module):
                 not no_async_tensor_model_parallel_allreduce and
                 world_size > 1)
         self.sequence_parallel = (
-                args.sequence_parallel and
+                sequence_parallel and
                 world_size > 1)
         assert not self.async_tensor_model_parallel_allreduce or \
             not self.sequence_parallel
-        self.gradient_accumulation_fusion = args.gradient_accumulation_fusion
+        self.gradient_accumulation_fusion = gradient_accumulation_fusion
 
     def forward(self, input_):
         bias = self.bias if not self.skip_bias_add else None
@@ -510,7 +512,9 @@ class RowParallelLinear(torch.nn.Module):
                  init_method=init.xavier_normal_, stride=1,
                  keep_master_weight_for_test=False,
                  skip_bias_add=False, use_cpu_initialization=True,
-                 dtype=torch.half):
+                 dtype=torch.half,
+                 sequence_parallel=False,
+                 gradient_accumulation_fusion=False):
         super(RowParallelLinear, self).__init__()
         # Keep input parameters
         self.input_size = input_size
@@ -548,14 +552,14 @@ class RowParallelLinear(torch.nn.Module):
                 self.bias = Parameter(torch.empty(
                     self.output_size, device=torch.cuda.current_device(),
                     dtype=dtype))
-            setattr(self.bias, 'sequence_parallel', args.sequence_parallel)
+            setattr(self.bias, 'sequence_parallel', sequence_parallel)
             # Always initialize bias to zero.
             with torch.no_grad():
                 self.bias.zero_()
         else:
             self.register_parameter('bias', None)
-        self.sequence_parallel = args.sequence_parallel
-        self.gradient_accumulation_fusion = args.gradient_accumulation_fusion
+        self.sequence_parallel = sequence_parallel
+        self.gradient_accumulation_fusion = gradient_accumulation_fusion
 
 
 
