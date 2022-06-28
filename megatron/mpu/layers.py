@@ -40,6 +40,8 @@ from .utils import divide
 from .utils import split_tensor_along_last_dim
 from .utils import VocabUtility
 from megatron import get_args, get_global_memory_buffer
+# from megatron.model.fused_bias_gelu import bias_gelu, bias_gelu_back
+
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {'tensor_model_parallel': False,
                                       'partition_dim': -1,
@@ -241,6 +243,18 @@ class VocabParallelEmbedding(torch.nn.Module):
         return output
 
 
+@torch.jit.script
+def gelu(x):
+    return  x * 0.5 * (1.0 + torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x)))
+
+@torch.jit.script
+def gelu_back(g, x):
+    tanh_out = torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x))
+    # sqrt(2/pi) * 3 * 0.044715 -> 0.1070322243
+    ff = 0.5 * x * ((1 - tanh_out * tanh_out) * (0.79788456 + 0.1070322243 * x * x)) + 0.5 * (1 + tanh_out)
+    return ff*g
+
+
 class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     """
     Linear layer execution with asynchronous communication and gradient accumulation
@@ -249,14 +263,16 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input, weight, bias, gradient_accumulation_fusion,
-                async_grad_allreduce, sequence_parallel):
+                async_grad_allreduce, sequence_parallel, apply_pre_gelu=False):
         ctx.save_for_backward(input, weight)
         ctx.use_bias = bias is not None
         ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
         ctx.async_grad_allreduce = async_grad_allreduce
         ctx.sequence_parallel = sequence_parallel
+        ctx.apply_pre_gelu = apply_pre_gelu
 
         if sequence_parallel:
+            assert not ctx.apply_pre_gelu
             world_size = get_tensor_model_parallel_world_size()
             dim_size = list(input.size())
             dim_size[0] = dim_size[0] * world_size
@@ -270,6 +286,9 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             total_input = all_gather_buffer
         else:
             total_input = input
+
+        if ctx.apply_pre_gelu:
+            total_input = gelu(total_input)
 
         output = torch.matmul(total_input, weight.t())
         if bias is not None:
@@ -303,6 +322,10 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         if ctx.sequence_parallel:
             handle.wait()
+
+        if ctx.apply_pre_gelu:
+            grad_input = gelu_back(grad_input, total_input)
+            total_input = gelu(total_input)
 
         # Convert the tensor shapes to 2D for execution compatibility
         grad_output = grad_output.view(grad_output.shape[0] * grad_output.shape[1],
@@ -343,12 +366,12 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         if ctx.sequence_parallel:
             handle.wait()
-            return sub_grad_input, grad_weight, grad_bias, None, None, None
+            return sub_grad_input, grad_weight, grad_bias, None, None, None, None
 
         if ctx.async_grad_allreduce:
             handle.wait()
 
-        return grad_input, grad_weight, grad_bias, None, None, None
+        return grad_input, grad_weight, grad_bias, None, None, None, None
 
 
 class ColumnParallelLinear(torch.nn.Module):
@@ -466,7 +489,7 @@ class ColumnParallelLinear(torch.nn.Module):
         # Matrix multiply.
         output_parallel = LinearWithGradAccumulationAndAsyncCommunication.apply(
             input_parallel, self.weight, bias, self.gradient_accumulation_fusion,
-            self.async_tensor_model_parallel_allreduce, self.sequence_parallel)
+            self.async_tensor_model_parallel_allreduce, self.sequence_parallel, False)
         if self.gather_output:
             # All-gather across the partitions.
             assert not self.sequence_parallel
@@ -573,7 +596,7 @@ class RowParallelLinear(torch.nn.Module):
         # Matrix multiply.
         output_parallel = LinearWithGradAccumulationAndAsyncCommunication.apply(
             input_parallel, self.weight, None,
-            self.gradient_accumulation_fusion, None, None)
+            self.gradient_accumulation_fusion, None, None, False)
         # All-reduce across all the partitions.
         if self.sequence_parallel:
             output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
@@ -587,3 +610,29 @@ class RowParallelLinear(torch.nn.Module):
             output_bias = self.bias
         return output, output_bias
 
+
+class GeLURowParallelLinear(RowParallelLinear):
+
+    def forward(self, input_):
+        # Set up backprop all-reduce.
+        if self.input_is_parallel:
+            input_parallel = input_
+        else:
+            assert not self.sequence_parallel
+            input_parallel = scatter_to_tensor_model_parallel_region(input_)
+        # Matrix multiply.
+        output_parallel = LinearWithGradAccumulationAndAsyncCommunication.apply(
+            input_parallel, self.weight, None,
+            self.gradient_accumulation_fusion, None, None, True)
+        # All-reduce across all the partitions.
+        if self.sequence_parallel:
+            output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
+        else:
+            output_ = reduce_from_tensor_model_parallel_region(output_parallel)
+        if not self.skip_bias_add:
+            output = output_ + self.bias if self.bias is not None else output_
+            output_bias = None
+        else:
+            output = output_
+            output_bias = self.bias
+        return output, output_bias
