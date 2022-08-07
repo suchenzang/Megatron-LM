@@ -52,7 +52,6 @@ from .initialize import model_parallel_is_initialized
 from .layers import LinearWithGradAccumulationAndAsyncCommunication
 from .layers import ColumnParallelLinear
 from .layers import RowParallelLinear
-from .layers import GeLURowParallelLinear
 from .layers import VocabParallelEmbedding
 from .layers import (set_tensor_model_parallel_attributes,
                      set_defaults_if_not_set_tensor_model_parallel_attributes,
