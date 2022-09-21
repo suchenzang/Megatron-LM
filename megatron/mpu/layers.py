@@ -19,6 +19,7 @@
 
 
 import math
+import importlib
 
 import torch
 import torch.nn.functional as F
@@ -35,12 +36,18 @@ from .mappings import reduce_from_tensor_model_parallel_region
 from .mappings import scatter_to_tensor_model_parallel_region
 from .mappings import reduce_scatter_to_sequence_parallel_region
 
+from .mappings import _reduce_scatter_along_first_dim, _gather_along_first_dim
+
 from .random import get_cuda_rng_tracker
 from .utils import divide
-from .utils import split_tensor_along_last_dim
+from .utils import split_tensor_along_last_dim, split_tensor_by_given_split_sizes
 from .utils import VocabUtility
 from megatron import get_args, get_global_memory_buffer
 # from megatron.model.fused_bias_gelu import bias_gelu, bias_gelu_back
+
+global fused_layer_norm_cuda
+fused_layer_norm_cuda = None
+
 
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {'tensor_model_parallel': False,
@@ -410,6 +417,9 @@ class ColumnParallelLinear(torch.nn.Module):
                  sequence_parallel=False,
                  gradient_accumulation_fusion=False):
         super(ColumnParallelLinear, self).__init__()
+        global fused_layer_norm_cuda
+        if fused_layer_norm_cuda is None:
+            fused_layer_norm_cuda = importlib.import_module("fused_layer_norm_cuda")
 
         # Keep input parameters
         self.input_size = input_size
@@ -614,55 +624,472 @@ class RowParallelLinear(torch.nn.Module):
         return output, output_bias
 
 
-# class GeLURowParallelLinear(RowParallelLinear):
+class TransformerBlockAutograd(torch.autograd.Function):
+    """
+    This is custom FFN autograd function hardcoded for:
+    bias: false,
+    layernorm affine: false, ln eps: 1e-5
+    sequence_parallel: true,
+    activation: gelu,
+    gelu, layernorm: always recomputed i.e. no activation memory for these
+    """
+    @staticmethod
+    def forward_mha(q, k, v, bsz, seq_len, head_dim, embed_dim_per_partition, dtype):
+        import scaled_upper_triang_masked_softmax_cuda
+        scaling = head_dim ** -0.5
+        matmul_result = torch.empty(
+            bsz * (embed_dim_per_partition // head_dim),
+            seq_len,
+            seq_len,
+            dtype=dtype,
+            device=torch.cuda.current_device(),
+        )
+        # Scale q,k before matmul for stability see https://tinyurl.com/sudb9s96 for math
+        matmul_result = torch.baddbmm(
+            matmul_result,
+            math.sqrt(scaling) * q.transpose(0, 1),
+            math.sqrt(scaling) * k.transpose(0, 1).transpose(1, 2),
+            beta=0.0,
+        )
+        # attn_probs = matmul_result
+        scale_t = torch.tensor([1.0])
+        attn_probs = scaled_upper_triang_masked_softmax_cuda.forward(matmul_result, scale_t[0])
+        attn = torch.bmm(attn_probs, v)
+        attn = attn.transpose(0, 1).contiguous().view(seq_len, bsz, -1)
+        return attn, attn_probs
 
-#     def forward(self, input_):
-#         # Set up backprop all-reduce.
-#         if self.input_is_parallel:
-#             input_parallel = input_
-#         else:
-#             assert not self.sequence_parallel
-#             input_parallel = scatter_to_tensor_model_parallel_region(input_)
-#         # Matrix multiply.
-#         output_parallel = LinearWithGradAccumulationAndAsyncCommunication.apply(
-#             input_parallel, self.weight, None,
-#             self.gradient_accumulation_fusion, None, None, True)
-#         # All-reduce across all the partitions.
-#         if self.sequence_parallel:
-#             output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
-#         else:
-#             output_ = reduce_from_tensor_model_parallel_region(output_parallel)
-#         if not self.skip_bias_add:
-#             output = output_ + self.bias if self.bias is not None else output_
-#             output_bias = None
-#         else:
-#             output = output_
-#             output_bias = self.bias
-#         return output, output_bias
+
+    @staticmethod
+    def backward_mha(grad_mha_output, q, k, v, attn_probs, seq_len, bsz, head_dim):
+        import scaled_upper_triang_masked_softmax_cuda
+        scaling = head_dim ** -0.5
+        grad_mha_output= grad_mha_output.view(seq_len, -1, head_dim).transpose(0, 1)
+        grad_v = torch.bmm(attn_probs.transpose(1,2), grad_mha_output).transpose(0, 1).contiguous().view(seq_len, bsz, -1)
+        grad_attn_probs_out = torch.bmm(grad_mha_output, v.transpose(1, 2))
+
+        grad_attn_probs_in = scaled_upper_triang_masked_softmax_cuda.backward(
+            grad_attn_probs_out, attn_probs, 1.0
+        )
+        grad_q = torch.bmm(
+            math.sqrt(scaling) * grad_attn_probs_in,
+            math.sqrt(scaling) * k.transpose(0,1)
+        )
+        grad_q = grad_q.transpose(0, 1).contiguous().view(seq_len, bsz, -1)
+        grad_k = torch.bmm(
+            math.sqrt(scaling) * grad_attn_probs_in.transpose(1,2),
+            math.sqrt(scaling) * q.transpose(0,1)
+        )
+        grad_k = grad_k.transpose(0, 1).contiguous().view(seq_len, bsz, -1)
+        grad_kvq_proj_output = torch.cat([grad_k, grad_v, grad_q], dim=-1)
+        return grad_kvq_proj_output
+
+    @staticmethod
+    def forward(
+        ctx,
+        input,
+        kvq_proj_weight,
+        out_proj_weight,
+        fc1_weight,
+        fc2_weight,
+        head_dim,
+        recompute_fc1,
+    ):
+        global fused_layer_norm_cuda
+        ctx.recompute_fc1 = recompute_fc1
+
+        input = input.contiguous()
+
+        # Take out residual connection for self attention
+        residual = input
+        dtype = input.dtype
+
+        # Apply layer norm on (seq_len // #tp_size, bsz, embed_dim) tensor
+        ctx.layer_norm_normalized_shape = torch.Size((input.size(-1),))
+        ctx.eps = 1e-5
+
+        # # Self attention layer norm
+        mha_layer_norm_output, _, _ = fused_layer_norm_cuda.forward(input, ctx.layer_norm_normalized_shape, ctx.eps)
+
+        # all gather output across first dim, i.e. seq_len dim for kvq_proj
+        mha_layer_norm_output = _gather_along_first_dim(mha_layer_norm_output, cached_buffer_name='mpu')
+
+        # apply kvq, output is (seq_len, bsz, 3 * embed_dim // #tp_size)
+        kvq_out = torch.matmul(mha_layer_norm_output, kvq_proj_weight.t())
+        # the order here doesn't matter as much as long its consistent sice initialization is same.
+        # just matching the ordewr of metaseq MHA.
+        k, v, q = split_tensor_along_last_dim(kvq_out, 3, contiguous_split_chunks=True)
+        seq_len, bsz, embed_dim_per_partition = q.size()
+        q  = q.view(seq_len, -1, head_dim)
+        k  = k.view(seq_len, -1, head_dim)
+        v  = v.view(seq_len, -1, head_dim).transpose(0, 1)
+
+        attn, _ = TransformerBlockAutograd.forward_mha(q, k, v, bsz, seq_len, head_dim, embed_dim_per_partition, dtype)
+
+        out_proj_out = torch.matmul(attn, out_proj_weight.t())
+        out_proj_out = _reduce_scatter_along_first_dim(out_proj_out)
+
+        # out_proj_out = out_proj_out + residual
+        out_proj_out = out_proj_out + residual
+
+        # Take out residual connection for FFN
+        residual = out_proj_out
+        # No need to save mean and invvar cause we redo layernorm in backward
+        ffn_layer_norm_output, _, _ = fused_layer_norm_cuda.forward(out_proj_out, ctx.layer_norm_normalized_shape, ctx.eps)
+
+        # all gather output across first dim, i.e. seq_len dim
+        ffn_layer_norm_output = _gather_along_first_dim(ffn_layer_norm_output, cached_buffer_name='mpu')
+
+        # apply fc1, output is (seq_len, bsz, 4 * embed_dim // #tp_size)
+        fc1_out = torch.matmul(ffn_layer_norm_output, fc1_weight.t())
+        # apply gelu
+        gelu_out = gelu(fc1_out)
+        # apply fc2, output (seq_len, bsz, embed_dim) but needs to be
+        # summed across tp for real output
+        fc2_out = torch.matmul(gelu_out, fc2_weight.t())
+
+        if ctx.recompute_fc1:
+            fc1_out = None
+        ctx.save_for_backward(
+            input,
+            q,
+            k,
+            v,
+            out_proj_out,
+            kvq_proj_weight,
+            out_proj_weight,
+            fc1_out,
+            fc1_weight,
+            fc2_weight,
+        )
+        ctx.bsz, ctx.seq_len, ctx.head_dim, ctx.embed_dim_per_partition = bsz, seq_len, head_dim, embed_dim_per_partition
+
+        # apply scatter gather,
+        # input: (seq_len, bsz, embed_dim)
+        # output: (seq_len // #tp_size, bsz, embed_dim) (and embed_dim is summed across gpus)
+        fc2_out_post_scatter_gather = _reduce_scatter_along_first_dim(fc2_out)
+        final_out = fc2_out_post_scatter_gather + residual
+        return final_out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        global fused_layer_norm_cuda
+        input, q, k, v, out_proj_out, kvq_proj_weight, out_proj_weight, fc1_out, fc1_weight, fc2_weight = ctx.saved_tensors
+        bsz, seq_len, head_dim, embed_dim_per_partition = ctx.bsz, ctx.seq_len, ctx.head_dim, ctx.embed_dim_per_partition
+        dtype = grad_output.dtype
+
+        residual_grad = grad_output
+
+        # gatther gradients async,
+        # and we can overlap this with any recomptation.
+        grad_output, handle = _gather_along_first_dim(grad_output, async_op=True)
+
+        # Both of these operations are just recomputed from forward to save activation memory.
+        ffn_layer_norm_output, ffn_layer_norm_mean, ffn_layer_norm_invvar = fused_layer_norm_cuda.forward(out_proj_out, ctx.layer_norm_normalized_shape, ctx.eps)
+        # recompute gelu output for calculating fc2 weight gradient
+        # note, remember "gelu_out = fc2_in"
+        if not ctx.recompute_fc1:
+            assert fc1_out is not None
+            gelu_out = gelu(fc1_out)
+
+        # Now wait for reduce scatter
+        handle.wait()
+
+        ffn_layer_norm_output, handle = _gather_along_first_dim(ffn_layer_norm_output, async_op=True, cached_buffer_name='mpu')
+
+        grad_fc2_input = grad_output.matmul(fc2_weight)
+
+        if ctx.recompute_fc1:
+            handle.wait()
+            assert fc1_out is None
+            fc1_out = torch.matmul(ffn_layer_norm_output, fc1_weight.t())
+            gelu_out = gelu(fc1_out)
+
+        # calculate gelu backward
+        grad_gelu_input = gelu_back(grad_fc2_input, fc1_out)
+
+        # Reshape matrix and calculate gradient with respect to fc2 weight
+        grad_output = TransformerBlockAutograd._collapse_first_dimensions(
+            grad_output
+        )
+        gelu_out = TransformerBlockAutograd._collapse_first_dimensions(gelu_out)
+        grad_fc2_weight = grad_output.t().matmul(gelu_out)
+
+        grad_fc1_input = grad_gelu_input.matmul(fc1_weight)
+        handle.wait()
+
+        grad_gelu_input = TransformerBlockAutograd._collapse_first_dimensions(grad_gelu_input)
+        ffn_layer_norm_output = TransformerBlockAutograd._collapse_first_dimensions(ffn_layer_norm_output)
+
+        grad_fc1_input, handle = _reduce_scatter_along_first_dim(grad_fc1_input, async_op=True)
+
+        grad_fc1_weight = grad_gelu_input.t().matmul(ffn_layer_norm_output)
+
+        handle.wait()
+
+        grad_attention_output = fused_layer_norm_cuda.backward(
+            grad_fc1_input.contiguous(),
+            ffn_layer_norm_mean,
+            ffn_layer_norm_invvar,
+            out_proj_out,
+            ctx.layer_norm_normalized_shape,
+            ctx.eps,
+        )
+        grad_attention_output = grad_attention_output + residual_grad
+
+        residual_grad = grad_attention_output
+
+        grad_attention_output, handle = _gather_along_first_dim(
+            grad_attention_output,
+            async_op=True,
+        )
+
+        # recalculate attention
+        attn, attn_probs = TransformerBlockAutograd.forward_mha(q, k, v, bsz, seq_len, head_dim, embed_dim_per_partition, dtype)
+
+        handle.wait()
+
+        grad_out_proj_input = grad_attention_output.matmul(out_proj_weight)
+        grad_attention_output = TransformerBlockAutograd._collapse_first_dimensions(
+            grad_attention_output
+        )
+        attn = TransformerBlockAutograd._collapse_first_dimensions(attn)
+        grad_out_proj_weight = grad_attention_output.t().matmul(attn)
+
+        grad_kvq_proj_output = TransformerBlockAutograd.backward_mha(
+            grad_out_proj_input,
+            q,
+            k,
+            v,
+            attn_probs,
+            seq_len,
+            bsz,
+            head_dim
+        )
+
+        mha_layer_norm_output, mha_layer_norm_mean, mha_layer_norm_invvar = fused_layer_norm_cuda.forward(input, ctx.layer_norm_normalized_shape, ctx.eps)
+        mha_layer_norm_output, handle = _gather_along_first_dim(
+            mha_layer_norm_output,
+            async_op=True,
+            cached_buffer_name='mpu',
+        )
+        grad_input = grad_kvq_proj_output.matmul(kvq_proj_weight)
+        handle.wait()
+
+        grad_input, handle = _reduce_scatter_along_first_dim(
+            grad_input,
+            async_op=True
+        )
+        mha_layer_norm_output = TransformerBlockAutograd._collapse_first_dimensions(mha_layer_norm_output)
+        grad_kvq_proj_output = TransformerBlockAutograd._collapse_first_dimensions(grad_kvq_proj_output)
+        grad_kvq_weight = grad_kvq_proj_output.t().matmul(mha_layer_norm_output)
+        handle.wait()
+
+        grad_input = fused_layer_norm_cuda.backward(
+            grad_input.contiguous(),
+            mha_layer_norm_mean,
+            mha_layer_norm_invvar,
+            input,
+            ctx.layer_norm_normalized_shape,
+            ctx.eps,
+        )
+        grad_input = grad_input + residual_grad
+        return grad_input, grad_kvq_weight, grad_out_proj_weight, grad_fc1_weight, grad_fc2_weight, None, None
+
+    @staticmethod
+    def _collapse_first_dimensions(tensor):
+        return tensor.view(
+            tensor.shape[0] * tensor.shape[1],
+            tensor.shape[2],
+        )
 
 
-# class GeLURowParallelLinear(RowParallelLinear):
+class ParallelTransformerBlockAutograd(TransformerBlockAutograd):
+    """
+    This is custom FFN autograd function hardcoded for:
+    bias: false,
+    layernorm affine: false, ln eps: 1e-5
+    sequence_parallel: true,
+    activation: gelu,
+    gelu, layernorm: always recomputed i.e. no activation memory for these
+    """
+    @staticmethod
+    def forward(
+        ctx,
+        input,
+        kvq_fc1_proj_weight,
+        out_proj_weight,
+        fc2_weight,
+        head_dim,
+        recompute_kvq_fc1
+    ):
+        global fused_layer_norm_cuda
+        ctx.recompute_kvq_fc1 = recompute_kvq_fc1
 
-#     def forward(self, input_):
-#         # Set up backprop all-reduce.
-#         if self.input_is_parallel:
-#             input_parallel = input_
-#         else:
-#             assert not self.sequence_parallel
-#             input_parallel = scatter_to_tensor_model_parallel_region(input_)
-#         # Matrix multiply.
-#         output_parallel = LinearWithGradAccumulationAndAsyncCommunication.apply(
-#             input_parallel, self.weight, None,
-#             self.gradient_accumulation_fusion, None, None, True)
-#         # All-reduce across all the partitions.
-#         if self.sequence_parallel:
-#             output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
-#         else:
-#             output_ = reduce_from_tensor_model_parallel_region(output_parallel)
-#         if not self.skip_bias_add:
-#             output = output_ + self.bias if self.bias is not None else output_
-#             output_bias = None
-#         else:
-#             output = output_
-#             output_bias = self.bias
-#         return output, output_bias
+        input = input.contiguous()
+
+        # Take out residual connection for self attention
+        residual = input
+        dtype = input.dtype
+
+        # Apply layer norm on (seq_len // #tp_size, bsz, embed_dim) tensor
+        ctx.layer_norm_normalized_shape = torch.Size((input.size(-1),))
+        ctx.eps = 1e-5
+
+        # # Self attention layer norm
+        layer_norm_output, _, _ = fused_layer_norm_cuda.forward(input, ctx.layer_norm_normalized_shape, ctx.eps)
+
+        # all gather output across first dim, i.e. seq_len dim for kvq_proj
+        layer_norm_output = _gather_along_first_dim(layer_norm_output, cached_buffer_name='mpu')
+
+        # apply kvq, output is (seq_len, bsz, 3 * embed_dim // #tp_size)
+        kvq_fc1_output = torch.matmul(layer_norm_output, kvq_fc1_proj_weight.t())
+        # the order here doesn't matter as much as long its consistent sice initialization is same.
+        # just matching the ordewr of metaseq MHA.'
+
+        embed_dim_per_partition = kvq_fc1_output.size(kvq_fc1_output.dim() - 1) // 7
+        split_sizes = [embed_dim_per_partition] * 3 + [4 * embed_dim_per_partition]
+        k, v, q, fc1_out = split_tensor_by_given_split_sizes(kvq_fc1_output, split_sizes, contiguous_split_chunks=True)
+        seq_len, bsz, embed_dim_per_partition = q.size()
+        q  = q.view(seq_len, -1, head_dim)
+        k  = k.view(seq_len, -1, head_dim)
+        v  = v.view(seq_len, -1, head_dim).transpose(0, 1)
+
+        attn, _ = TransformerBlockAutograd.forward_mha(q, k, v, bsz, seq_len, head_dim, embed_dim_per_partition, dtype)
+
+        out_proj_out = torch.matmul(attn, out_proj_weight.t())
+
+        # apply gelu
+        gelu_out = gelu(fc1_out)
+        # apply fc2, output (seq_len, bsz, embed_dim) but needs to be
+        # summed across tp for real output
+        fc2_out = torch.matmul(gelu_out, fc2_weight.t())
+
+        final_out = fc2_out + out_proj_out
+
+        # apply scatter gather,
+        # input: (seq_len, bsz, embed_dim)
+        # output: (seq_len // #tp_size, bsz, embed_dim) (and embed_dim is summed across gpus)
+        final_out = _reduce_scatter_along_first_dim(final_out)
+
+        final_out = final_out + residual
+
+        if ctx.recompute_kvq_fc1:
+            q, k, v, fc1_out = None, None, None, None
+
+        ctx.save_for_backward(
+            input,
+            q,
+            k,
+            v,
+            fc1_out,
+            kvq_fc1_proj_weight,
+            out_proj_weight,
+            fc2_weight,
+        )
+        ctx.bsz, ctx.seq_len, ctx.head_dim, ctx.embed_dim_per_partition = bsz, seq_len, head_dim, embed_dim_per_partition
+        return final_out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        global fused_layer_norm_cuda
+        input, q, k, v, fc1_out, kvq_fc1_proj_weight, out_proj_weight, fc2_weight = ctx.saved_tensors
+        bsz, seq_len, head_dim, embed_dim_per_partition = ctx.bsz, ctx.seq_len, ctx.head_dim, ctx.embed_dim_per_partition
+        dtype = grad_output.dtype
+
+        residual_grad = grad_output
+
+        # gatther gradients async,
+        # and we can overlap this with any recomptation.
+        grad_output, handle = _gather_along_first_dim(grad_output, async_op=True)
+
+        # Both of these operations are just recomputed from forward to save activation memory.
+        layer_norm_output, layer_norm_mean, layer_norm_invvar = fused_layer_norm_cuda.forward(input, ctx.layer_norm_normalized_shape, ctx.eps)
+        # recompute gelu output for calculating fc2 weight gradient
+        # note, remember "gelu_out = fc2_in"
+        if not ctx.recompute_kvq_fc1:
+            assert fc1_out is not None
+            gelu_out = gelu(fc1_out)
+
+            # recalculate attention
+            attn, attn_probs = TransformerBlockAutograd.forward_mha(q, k, v, bsz, seq_len, head_dim, embed_dim_per_partition, dtype)
+
+        # Now wait for reduce scatter
+        handle.wait()
+
+        layer_norm_output, handle = _gather_along_first_dim(layer_norm_output, async_op=True, cached_buffer_name='mpu')
+
+        grad_fc2_input = grad_output.matmul(fc2_weight)
+
+        if ctx.recompute_kvq_fc1:
+            handle.wait()
+            assert fc1_out is None
+
+            kvq_fc1_output = torch.matmul(layer_norm_output, kvq_fc1_proj_weight.t())
+            embed_dim_per_partition = kvq_fc1_output.size(kvq_fc1_output.dim() - 1) // 7
+            split_sizes = [embed_dim_per_partition] * 3 + [4 * embed_dim_per_partition]
+            k, v, q, fc1_out = split_tensor_by_given_split_sizes(kvq_fc1_output, split_sizes, contiguous_split_chunks=True)
+            seq_len, bsz, embed_dim_per_partition = q.size()
+            q  = q.view(seq_len, -1, head_dim)
+            k  = k.view(seq_len, -1, head_dim)
+            v  = v.view(seq_len, -1, head_dim).transpose(0, 1)
+
+            gelu_out = gelu(fc1_out)
+            attn, attn_probs = TransformerBlockAutograd.forward_mha(q, k, v, bsz, seq_len, head_dim, embed_dim_per_partition, dtype)
+
+        # calculate gelu backward
+        grad_gelu_input = gelu_back(grad_fc2_input, fc1_out)
+
+        # calculate gradient of outproj
+        grad_out_proj_input = grad_output.matmul(out_proj_weight)
+
+        # Reshape matrix and calculate gradient with respect to fc2 weight
+        grad_output = TransformerBlockAutograd._collapse_first_dimensions(grad_output)
+        gelu_out = TransformerBlockAutograd._collapse_first_dimensions(gelu_out)
+        grad_fc2_weight = grad_output.t().matmul(gelu_out)
+
+        attn = TransformerBlockAutograd._collapse_first_dimensions(attn)
+        grad_out_proj_weight = grad_output.t().matmul(attn)
+
+
+        grad_kvq_proj_output = TransformerBlockAutograd.backward_mha(
+            grad_out_proj_input,
+            q,
+            k,
+            v,
+            attn_probs,
+            seq_len,
+            bsz,
+            head_dim
+        )
+
+        grad_kvq_fc1_proj_output = torch.cat([grad_kvq_proj_output, grad_gelu_input], dim=-1)
+        grad_input = grad_kvq_fc1_proj_output.matmul(kvq_fc1_proj_weight)
+
+        handle.wait()
+
+        grad_input, handle = _reduce_scatter_along_first_dim(
+            grad_input,
+            async_op=True
+        )
+        layer_norm_output = TransformerBlockAutograd._collapse_first_dimensions(layer_norm_output)
+        grad_kvq_fc1_proj_output = TransformerBlockAutograd._collapse_first_dimensions(grad_kvq_fc1_proj_output)
+        grad_kvq_fc1_weight = grad_kvq_fc1_proj_output.t().matmul(layer_norm_output)
+        handle.wait()
+
+        grad_input = fused_layer_norm_cuda.backward(
+            grad_input.contiguous(),
+            layer_norm_mean,
+            layer_norm_invvar,
+            input,
+            ctx.layer_norm_normalized_shape,
+            ctx.eps,
+        )
+        grad_input = grad_input + residual_grad
+        return grad_input, grad_kvq_fc1_weight, grad_out_proj_weight, grad_fc2_weight, None, None
+
+    @staticmethod
+    def _collapse_first_dimensions(tensor):
+        return tensor.view(
+            tensor.shape[0] * tensor.shape[1],
+            tensor.shape[2],
+        )
