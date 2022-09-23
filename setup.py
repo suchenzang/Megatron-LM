@@ -18,7 +18,8 @@
 import os
 import sys
 import setuptools
-
+import pathlib
+from torch.utils.cpp_extension import CppExtension, BuildExtension
 if sys.version_info < (3,):
     raise Exception("Python 2 is not supported by Megatron.")
 
@@ -48,6 +49,36 @@ def req_file(filename):
 
 
 install_requires = req_file("requirements.txt")
+
+srcpath = pathlib.Path('megatron') / 'fused_kernels'
+
+def _fused_extension(name, sources, extra_cuda_flags):
+    return CppExtension(name,
+                        sources=[str(source) for source in sources],
+                        extra_cflags=['-O3', ],
+                        extra_cuda_cflags=['-O3', '--use_fast_math'] + extra_cuda_flags)
+
+
+extension_modules = [
+    _fused_extension('megatron.fused_kernels.scaled_upper_triang_masked_softmax_cuda',
+        sources=[srcpath / 'scaled_upper_triang_masked_softmax.cpp',
+                 srcpath / 'scaled_upper_triang_masked_softmax_cuda.cu'],
+        extra_cuda_flags=['-U__CUDA_NO_HALF_OPERATORS__',
+                          '-U__CUDA_NO_HALF_CONVERSIONS__',
+                          '--expt-relaxed-constexpr',
+                          '--expt-extended-lambda']),
+    _fused_extension('megatron.fused_kernels.scaled_masked_softmax_cuda',
+        sources=[srcpath / 'scaled_masked_softmax.cpp',
+                 srcpath / 'scaled_masked_softmax_cuda.cu'],
+        extra_cuda_flags=['-U__CUDA_NO_HALF_OPERATORS__',
+                          '-U__CUDA_NO_HALF_CONVERSIONS__',
+                          '--expt-relaxed-constexpr',
+                          '--expt-extended-lambda']),
+    _fused_extension('megatron.fused_kernels.fused_mix_prec_layer_norm_cuda',
+        sources=[srcpath / 'layer_norm_cuda.cpp',
+            srcpath / 'layer_norm_cuda_kernel.cu'],
+            extra_cuda_flags = ['-maxrregcount=50']),
+]
 
 setuptools.setup(
     name=__package_name__,
@@ -87,5 +118,7 @@ setuptools.setup(
     include_package_data=True,
     zip_safe=False,
     # PyPI package information.
-    keywords=__keywords__
+    keywords=__keywords__,
+    ext_modules=extension_modules,
+    cmdclass={'build_ext': BuildExtension}
 )
