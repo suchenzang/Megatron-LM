@@ -23,8 +23,7 @@ from torch.nn.parameter import Parameter
 from torch.nn import init
 import importlib
 
-global fused_mix_prec_layer_norm_cuda
-fused_mix_prec_layer_norm_cuda = None
+from megatron.fused_kernels import fused_mix_prec_layer_norm_cuda
 
 
 class FusedLayerNormAffineFunction(torch.autograd.Function):
@@ -63,11 +62,6 @@ class MixedFusedLayerNorm(torch.nn.Module):
 
   def __init__(self, normalized_shape, eps=1e-5):
         super(MixedFusedLayerNorm, self).__init__()
-
-        global fused_mix_prec_layer_norm_cuda
-        fused_mix_prec_layer_norm_cuda = importlib.import_module(
-          "fused_mix_prec_layer_norm_cuda")
-
         if isinstance(normalized_shape, numbers.Integral):
             normalized_shape = (normalized_shape,)
         self.normalized_shape = torch.Size(normalized_shape)

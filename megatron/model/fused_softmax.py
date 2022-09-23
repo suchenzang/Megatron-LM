@@ -17,7 +17,7 @@
 import torch
 import torch.nn as nn
 from megatron.model.enums import AttnMaskType
-
+from megatron.fused_kernels import scaled_masked_softmax_cuda, scaled_upper_triang_masked_softmax_cuda
 
 class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
     """
@@ -29,8 +29,6 @@ class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, inputs, scale):
-        import scaled_upper_triang_masked_softmax_cuda
-
         scale_t = torch.tensor([scale])
         softmax_results = scaled_upper_triang_masked_softmax_cuda.forward(
             inputs, scale_t[0]
@@ -41,8 +39,6 @@ class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, output_grads):
-        import scaled_upper_triang_masked_softmax_cuda
-
         softmax_results, scale_t = ctx.saved_tensors
         input_grads = scaled_upper_triang_masked_softmax_cuda.backward(
             output_grads, softmax_results, scale_t[0]
@@ -61,8 +57,6 @@ class ScaledMaskedSoftmax(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, inputs, mask, scale):
-        import scaled_masked_softmax_cuda
-
         scale_t = torch.tensor([scale])
 
         softmax_results = scaled_masked_softmax_cuda.forward(inputs, mask, scale_t[0])
@@ -71,8 +65,6 @@ class ScaledMaskedSoftmax(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, output_grads):
-        import scaled_masked_softmax_cuda
-
         softmax_results, scale_t = ctx.saved_tensors
 
         input_grads = scaled_masked_softmax_cuda.backward(
@@ -187,6 +179,4 @@ class FusedScaleMaskSoftmax(nn.Module):
 
     @staticmethod
     def get_batch_per_block(sq, sk, b, np):
-        import scaled_masked_softmax_cuda
-
         return scaled_masked_softmax_cuda.get_batch_per_block(sq, sk, b, np)
