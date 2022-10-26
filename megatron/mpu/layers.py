@@ -301,7 +301,9 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     def backward(ctx, grad_output):
         input, weight = ctx.saved_tensors
         use_bias = ctx.use_bias
-
+        # Most times its a no-op, but sometimes it is required,
+        # if user transposed the output of forward.
+        grad_output = grad_output.contiguous()
         if ctx.sequence_parallel:
             world_size = get_tensor_model_parallel_world_size()
             dim_size = list(input.size())
