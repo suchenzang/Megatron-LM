@@ -31,8 +31,7 @@ try:
 except:
     HAVE_PERSIST_LAYER_NORM = False
 
-global fused_mix_prec_layer_norm_cuda
-fused_mix_prec_layer_norm_cuda = None
+from megatron.fused_kernels import fused_mix_prec_layer_norm_cuda
 
 
 class FusedLayerNormAffineFunction(torch.autograd.Function):
@@ -74,10 +73,6 @@ class MixedFusedLayerNorm(torch.nn.Module):
                sequence_parallel=False):
         super(MixedFusedLayerNorm, self).__init__()
 
-        global fused_mix_prec_layer_norm_cuda
-        fused_mix_prec_layer_norm_cuda = importlib.import_module(
-          "fused_mix_prec_layer_norm_cuda")
-
         # List of hiddens sizes supported in the persistent layer norm kernel
         # If the hidden size is not supported, fall back to the non-persistent
         # kernel.
@@ -97,7 +92,7 @@ class MixedFusedLayerNorm(torch.nn.Module):
         self.reset_parameters()
         self.no_persist_layer_norm = no_persist_layer_norm
         self.sequence_parallel = sequence_parallel
-        
+
         # set sequence parallelism flag on weight and bias parameters
         setattr(self.weight, 'sequence_parallel', self.sequence_parallel)
         setattr(self.bias, 'sequence_parallel', self.sequence_parallel)
