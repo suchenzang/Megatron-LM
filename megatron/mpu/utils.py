@@ -51,6 +51,26 @@ def split_tensor_along_last_dim(tensor, num_partitions,
     return tensor_list
 
 
+def split_tensor_by_given_split_sizes(tensor, partition_sizes,
+                                contiguous_split_chunks=False):
+    """Split a tensor along its last dimension.
+    Arguments:
+        tensor: input tensor.
+        num_partitions: number of partitions to split the tensor
+        contiguous_split_chunks: If True, make each chunk contiguous
+                                 in memory.
+    """
+    # Get the size and dimension.
+    last_dim = tensor.dim() - 1
+    # Split.
+    tensor_list = torch.split(tensor, partition_sizes, dim=last_dim)
+    # Note: torch.split does not create contiguous tensors by default.
+    if contiguous_split_chunks:
+        return tuple(chunk.contiguous() for chunk in tensor_list)
+
+    return tensor_list
+
+
 class VocabUtility:
     """Split the vocabulary into `world_size` chunks amd return the
         first and last index of the vocabulary belonging to the `rank`

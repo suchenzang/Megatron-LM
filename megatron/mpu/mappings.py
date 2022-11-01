@@ -18,6 +18,8 @@ import torch
 from .initialize import get_tensor_model_parallel_group, get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
 from .utils import split_tensor_along_last_dim
 
+from megatron import get_global_memory_buffer
+
 import os
 if os.getenv("SET_ALL_REDUCE_DUMMY_VALUE", "0") == "1":
     set_all_reduce_dummy_value = True
@@ -102,7 +104,7 @@ def _gather_along_last_dim(input_):
     return output
 
 
-def _gather_along_first_dim(input_):
+def _gather_along_first_dim(input_, async_op=False, cached_buffer_name=None):
     """Gather tensors and concatinate along the first dimension."""
 
     world_size = get_tensor_model_parallel_world_size()
@@ -113,14 +115,25 @@ def _gather_along_first_dim(input_):
     dim_size = list(input_.size())
     dim_size[0] = dim_size[0] * world_size
 
-    output = torch.empty(dim_size, dtype=input_.dtype,
-                         device=torch.cuda.current_device())
-    torch.distributed._all_gather_base(output, input_.contiguous(),
-                                       group=get_tensor_model_parallel_group())
+    if cached_buffer_name is None:
+        output = torch.empty(dim_size, dtype=input_.dtype,
+                            device=torch.cuda.current_device())
+    else:
+        output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, cached_buffer_name)
+    handle = torch.distributed._all_gather_base(output, input_.contiguous(),
+                                       group=get_tensor_model_parallel_group(), async_op=async_op)
+
+    if async_op:
+        # Note: [Naman] I am still not sure if this is needed but original code
+        # for sequence_parallel had it, so for now keeping it.
+        # Delay the start of weight gradient computation shortly (3us) to have
+        # reduce scatter scheduled first and have GPU resources allocated
+        _ = torch.empty(1, device=input_.device) + 1
+        return output, handle
 
     return output
 
-def _reduce_scatter_along_first_dim(input_):
+def _reduce_scatter_along_first_dim(input_, async_op=False):
     """Reduce-scatter the input tensor across model parallel group."""
     world_size = get_tensor_model_parallel_world_size()
     # Bypass the function if we are using only 1 GPU.
@@ -135,8 +148,17 @@ def _reduce_scatter_along_first_dim(input_):
 
     output = torch.empty(dim_size, dtype=input_.dtype,
                          device=torch.cuda.current_device())
-    torch.distributed._reduce_scatter_base(output, input_.contiguous(),
-                                           group=get_tensor_model_parallel_group())
+    handle = torch.distributed._reduce_scatter_base(output, input_.contiguous(),
+                                           group=get_tensor_model_parallel_group(), async_op=async_op)
+
+    if async_op:
+        # Note: [Naman] I am still not sure if this is needed but original code
+        # for sequence_parallel had it, so for now keeping it.
+        # Delay the start of weight gradient computation shortly (3us) to have
+        # reduce scatter scheduled first and have GPU resources allocated
+        _ = torch.empty(1, device=input_.device) + 1
+        return output, handle
+
     return output
 
 
@@ -293,4 +315,3 @@ def gather_from_sequence_parallel_region(input_, tensor_parallel_output_grad=Tru
 
 def reduce_scatter_to_sequence_parallel_region(input_):
     return _ReduceScatterToSequenceParallelRegion.apply(input_)
-
